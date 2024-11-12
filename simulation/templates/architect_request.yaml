@@ -1,0 +1,12 @@
+type: architect_request
+metadata:
+  timestamp: ""
+  request_id: ""
+payload:
+  context_ref: ""
+  request_type: ""
+  description: ""
+  acceptance_criteria: []
+validation:
+  required: true
+  steps: []

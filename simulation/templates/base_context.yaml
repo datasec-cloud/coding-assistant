@@ -1,0 +1,16 @@
+metadata:
+  version: "1.0.0"
+  created_at: ""
+  session_id: ""
+context:
+  project:
+    name: ""
+    path: ""
+    current_branch: ""
+  interaction:
+    request_id: ""
+    type: ""
+    status: "pending"
+  validation:
+    required_steps: []
+    completed_steps: []
