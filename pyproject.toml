@@ -1,0 +1,59 @@
+[project]
+name = "coding-assistant"
+version = "0.1.0"
+description = "Interactive coding assistant system"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+dependencies = [
+    "pyyaml>=6.0",
+    "python-dotenv>=0.19.0",
+    "gitpython>=3.1.0",
+]
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+    "pylint>=2.8.0",
+    "pytest-cov>=2.12.0",
+    "isort>=5.10.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra -q"
+
+[tool.black]
+line-length = 100
+target-version = ['py39']
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 100
+
+[tool.pylint.messages_control]
+disable = [
+    "C0111",  # missing-docstring
+    "C0103",  # invalid-name
+    "C0330",  # bad-continuation
+    "C0326",  # bad-whitespace
+]
+
+[tool.pylint.format]
+max-line-length = "100"
+
+[tool.coverage.run]
+source = ["coding_assistant"]
+omit = ["tests/*", "**/__init__.py"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/coding_assistant"]
