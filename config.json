@@ -1,0 +1,99 @@
+{
+  "project_root": "coding-assistant",
+  "analysis": {
+    "enable_metrics": true,
+    "enable_dependencies": true,
+    "enable_patterns": true,
+    "max_file_size": 10000000
+  },
+  "output": {
+    "format": {
+      "type": "summary",
+      "indent": 2,
+      "sort_keys": false
+    },
+    "structure": {
+      "separate_files": true,
+      "files": {
+        "metrics": "metrics.json",
+        "patterns": "patterns.json",
+        "dependencies": "dependencies.json",
+        "summary": "summary.json",
+        "codemap": "code_map.txt"
+      }
+    },
+    "reports": {
+      "html": {
+        "enabled": true,
+        "template": "default",
+        "assets": {
+          "charts": true,
+          "graphs": true
+        }
+      },
+      "markdown": {
+        "enabled": true,
+        "include_toc": true,
+        "code_blocks": true
+      },
+      "pdf": {
+        "enabled": false,
+        "template": "default"
+      }
+    },
+    "visualizations": {
+      "enabled": true,
+      "types": {
+        "dependency_graph": {
+          "enabled": true,
+          "format": "mermaid",
+          "direction": "TD"
+        },
+        "complexity_trends": {
+          "enabled": true,
+          "chart_type": "line"
+        },
+        "pattern_distribution": {
+          "enabled": true,
+          "chart_type": "pie"
+        },
+        "metrics_radar": {
+          "enabled": true
+        }
+      }
+    },
+    "filters": {
+      "min_severity": "low",
+      "categories": ["metrics", "patterns", "dependencies"],
+      "hide_passed_checks": false
+    },
+    "path": "summary-llm-coder.md"
+  },
+  "exclude_patterns": [
+    "**/.*",
+    "**/node_modules/**",
+    "**/venv/**",
+    "**/__pycache__/**",
+    "**/tests/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/*.pyc",
+    "**/*.pyo",
+    "**/*.pyd",
+    "**/*.so",
+    "**/*.egg",
+    "**/*.egg-info",
+    "**/*.coverage",
+    "**/.pytest_cache/**",
+    "**/.mypy_cache/**",
+    "**/llm-work/**"
+  ],
+  "include_patterns": [
+    "**/*.py",
+    "**/*.pyx",
+    "**/*.pyi",
+    "requirements.txt",
+    "setup.py",
+    "pyproject.toml"
+  ]
+}

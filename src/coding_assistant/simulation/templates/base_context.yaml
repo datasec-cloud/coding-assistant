@@ -2,15 +2,47 @@ metadata:
   version: "1.0.0"
   created_at: ""
   session_id: ""
-context:
-  project:
-    name: ""
-    path: ""
-    current_branch: ""
-  interaction:
-    request_id: ""
-    type: ""
-    status: "pending"
-  validation:
-    required_steps: []
-    completed_steps: []
+  last_modified: ""
+
+system_context:
+  architecture_state: "initial"
+  global_constraints: {}
+  cache_policy:
+    mode: "memory"
+    ttl: "24h"
+    strategy: "hierarchical"
+  resilience_config:
+    circuit_breaker:
+      enabled: true
+      thresholds:
+        errors: 5
+        timeouts: 3
+    fallback:
+      strategy: "cache"
+
+domain_context:
+  business_rules: []
+  validation_rules: []
+  cached_patterns: []
+  impact_analysis:
+    scope: "local"
+    risk_level: "low"
+
+component_context:
+  local_state: {}
+  dependencies: []
+  cached_results: {}
+  performance_metrics:
+    response_time: []
+    cache_hits: 0
+    cache_misses: 0
+
+modification_context:
+  change_scope: []
+  validation_rules: {}
+  cache_strategy:
+    mode: "memory"
+    ttl: "6h"
+  fallback_options: ["cache", "degraded"]
+
+history: []
