@@ -11,6 +11,7 @@ import threading
 from collections import OrderedDict
 from coding_assistant.core.io.transaction import TransactionManager, OperationType
 import hashlib
+import time
 
 
 class CacheLevel(Enum):
@@ -97,15 +98,17 @@ class CacheConfig:
 class HierarchicalCache:
     """Enhanced hierarchical cache with resilience and learning capabilities"""
 
-    def __init__(self, base_dir: Path, config: Optional[CacheConfig] = None):
+    def __init__(self, base_dir: Path, config: Optional[CacheConfig] = None, 
+                 transaction_manager: Optional[TransactionManager] = None):
         self.config = config or CacheConfig()
         self.base_dir = Path(base_dir)
         self.logger = logging.getLogger(__name__)
+        self.transaction_manager = transaction_manager
 
-        # Memory caches with LRU implementation
-        self._caches: Dict[CacheLevel, OrderedDict] = {
-            level: OrderedDict() for level in CacheLevel
+        self._caches: Dict[CacheLevel, Dict[str, CacheEntry]] = {
+            level: {} for level in CacheLevel
         }
+
 
         # Thread safety
         self._locks: Dict[CacheLevel, threading.RLock] = {
@@ -120,12 +123,8 @@ class HierarchicalCache:
         self._error_counts: Dict[CacheLevel, int] = {
             level: 0 for level in CacheLevel
         }
-        self._circuit_broken: Dict[CacheLevel, bool] = {
-            level: False for level in CacheLevel
-        }
-        self._last_error_reset: Dict[CacheLevel, datetime] = {
-            level: datetime.now() for level in CacheLevel
-        }
+        self._circuit_broken: Dict[CacheLevel, bool] = {level: False for level in CacheLevel}
+        self._last_error_reset: Dict[CacheLevel, datetime] = {level: datetime.min for level in CacheLevel}
 
         # Initialize storage
         self._initialize_storage()
@@ -196,10 +195,11 @@ class HierarchicalCache:
             self._handle_error(level)
             return None
 
-    def set(self, key: str, value: Any, level: CacheLevel = CacheLevel.COMPONENT,
-            metadata: Dict = None, pattern_id: Optional[str] = None) -> bool:
-        """Set value in cache with transaction support"""
-        if not isinstance(key, str) or not key:
+    def set(self, key: str, value: Any, level: CacheLevel, metadata: Dict = None, pattern_id: str = None) -> bool:
+        if not isinstance(level, CacheLevel):
+            self.logger.warning(f"Invalid CacheLevel provided for set: {level}")
+            return False
+        if not key:
             self.logger.warning(f"Invalid key provided for set: {key}")
             return False
 
@@ -220,9 +220,11 @@ class HierarchicalCache:
                 )
                 entry.checksum = entry.calculate_checksum()
 
-                self._cache_in_memory(entry)
-                if self.config.mode in [CacheMode.PERSISTENT, CacheMode.HYBRID]:
-                    self._cache_in_persistent(entry)
+                if self.transaction_manager:
+                    with self.transaction_manager.transaction() as transaction_id:
+                        self._transactional_set(transaction_id, entry)
+                else:
+                    self._non_transactional_set(entry)
 
                 # Update pattern tracking
                 if pattern_id:
@@ -234,7 +236,6 @@ class HierarchicalCache:
             self.logger.error(f"Error setting cache entry {key}: {e}")
             self._handle_error(level)
             return False
-
 
     def _transactional_set(self, transaction_id: str, entry: CacheEntry):
         """Set cache entry with transaction support"""
@@ -488,8 +489,8 @@ class CacheManager:
     def __init__(self, base_dir: Path, transaction_manager: Optional[TransactionManager] = None):
         self.base_dir = Path(base_dir)
         self.config = CacheConfig()
-
-        # Initialize cache
+        
+        # Initialize cache with transaction manager
         self.cache = HierarchicalCache(
             self.base_dir / "cache",
             self.config,
@@ -500,14 +501,21 @@ class CacheManager:
         self.logger = logging.getLogger(__name__)
 
         # Start background threads for cleanup and monitoring
-        cleanup_thread = threading.Thread(target=self._periodic_cleanup, daemon=True)
-        cleanup_thread.start()
-
-        monitor_thread = threading.Thread(target=self._monitor_health, daemon=True)
-        monitor_thread.start()
+        self._shutdown_event = threading.Event()
+        self._cleanup_thread = threading.Thread(target=self._periodic_cleanup, daemon=True)
+        self._monitor_thread = threading.Thread(target=self._monitor_health, daemon=True)
+        
+        self._cleanup_thread.start()
+        self._monitor_thread.start()
 
     def get(self, key: str, level: CacheLevel = CacheLevel.COMPONENT) -> Optional[Any]:
         """Get value from cache"""
+        if not isinstance(level, CacheLevel):
+            self.logger.warning(f"Invalid CacheLevel provided for get: {level}")
+            return None
+        if not key:
+            self.logger.warning(f"Invalid key provided for get: {key}")
+            return None
         return self.cache.get(key, level)
 
     def set(self, key: str, value: Any, level: CacheLevel = CacheLevel.COMPONENT,
@@ -518,14 +526,14 @@ class CacheManager:
     def invalidate(self, key: str, level: Optional[CacheLevel] = None) -> None:
         """Invalidate cache entries"""
         if level:
-            with self._locks[level]:
-                self._caches[level].pop(key, None)
-                if self.config.mode in [CacheMode.PERSISTENT, CacheMode.HYBRID]:
+            with self.cache._locks[level]:
+                self.cache._caches[level].pop(key, None)
+                if self.cache.config.mode in [CacheMode.PERSISTENT, CacheMode.HYBRID]:
                     self._remove_persistent_entry(key, level)
         else:
             for cache_level in CacheLevel:
                 self.invalidate(key, cache_level)
-    
+
     def _remove_persistent_entry(self, key: str, level: CacheLevel):
         """Remove entry from persistent storage"""
         try:
@@ -556,29 +564,29 @@ class CacheManager:
 
     def _periodic_cleanup(self):
         """Periodic cleanup of expired cache entries"""
-        while True:
+        while not self._shutdown_event.is_set():
             try:
                 cleaned = self.cache.cleanup()
                 if cleaned > 0:
                     self.logger.info(f"Cleaned {cleaned} expired cache entries")
-                threading.Event().wait(3600)  # Run every hour
+                time.sleep(3600)  # Run every hour
             except Exception as e:
                 self.logger.error(f"Error in cache cleanup: {e}")
-                threading.Event().wait(60)  # Retry after a minute on error
-
+                time.sleep(60)  # Retry after a minute on error
+    
     def _monitor_health(self):
         """Monitor cache health and performance"""
-        while True:
+        while not self._shutdown_event.is_set():
             try:
                 stats = self.cache.get_stats()
                 for level, level_stats in stats.items():
                     if level != "patterns":  # Skip pattern stats
                         self._check_health_metrics(level, level_stats)
-                threading.Event().wait(300)  # Check every 5 minutes
+                time.sleep(300)  # Check every 5 minutes
             except Exception as e:
                 self.logger.error(f"Error in health monitoring: {e}")
-                threading.Event().wait(60)
-
+                time.sleep(60)
+    
     def _check_health_metrics(self, level: str, stats: Dict):
         """Check cache health metrics and log warnings"""
         # Check circuit breaker status
@@ -638,3 +646,9 @@ class CacheManager:
             for pattern, stats in pattern_stats.items()
             if stats["confidence"] >= self.cache.config.learning["confidence_threshold"]
         }
+    
+    def shutdown(self):
+        """Shutdown the cache manager"""
+        self._shutdown_event.set()
+        self._cleanup_thread.join()
+        self._monitor_thread.join()

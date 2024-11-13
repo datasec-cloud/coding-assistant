@@ -1,10 +1,12 @@
-# src/coding_assistant/core/context/manager.py
 from typing import Dict, Optional, List, Any, Union, Tuple
 from pathlib import Path
 from datetime import datetime
 import logging
 import yaml
 from enum import Enum
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import dataclasses
 
 from coding_assistant.core.context.cache_manager import CacheManager, CacheLevel, CacheMode
 from coding_assistant.core.context.version_manager import ContextVersionManager, VersionType, VersionInfo
@@ -12,8 +14,8 @@ from coding_assistant.core.context.validation import ContextValidator, Validatio
 from coding_assistant.core.io.handler import IOHandler
 from coding_assistant.core.io.transaction import TransactionManager, OperationType
 from coding_assistant.core.recovery.recovery_manager import RecoveryManager, Alert, AlertSeverity, RecoveryStatus
-import dataclasses
-import asyncio
+
+
 
 
 class ContextCategory(str, Enum):
@@ -32,7 +34,7 @@ class ContextManager:
         self.context_dir = self.base_dir / "context" / session_id
         self.logger = logging.getLogger(__name__)
 
-        # Initialize transaction manager first as it's required by other components
+        # Initialize transaction manager first
         self.transaction_manager = TransactionManager(self.base_dir / "transactions")
 
         # Initialize component managers with transaction support
@@ -43,6 +45,12 @@ class ContextManager:
         self.version_manager = ContextVersionManager(self.context_dir)
         self.io_handler = IOHandler(self.base_dir)
 
+        # Initialize recovery manager
+        self.recovery_manager = RecoveryManager(self.base_dir / "recovery")
+
+        # Thread pool for async operations
+        self.executor = ThreadPoolExecutor(max_workers=4)
+
         # Internal state
         self.current_context: Optional[Dict] = None
         self.current_version: Optional[str] = None
@@ -50,25 +58,19 @@ class ContextManager:
         # Pattern tracking
         self._access_patterns: Dict[str, List[datetime]] = {}
 
-        # Initialize recovery manager
-        self.recovery_manager = RecoveryManager(self.base_dir / "recovery")
-
-        # Register alert handlers
-        self._register_alert_handlers()
-
-        # Initialize storage and context
+        # Initialize storage
         self._initialize_storage()
 
-    def _initialize_storage(self) -> None:
+    async def _initialize_storage(self) -> None:
         """Initialize storage directories and base context"""
         try:
             self.context_dir.mkdir(parents=True, exist_ok=True)
 
             # Load or create initial context
-            context = self.load_context()
+            context = await self.load_context()
             if not context:
                 context = self._create_initial_context()
-                self.save_context(
+                await self.save_context(
                     context,
                     "Initial context creation",
                     VersionType.MAJOR,
@@ -76,8 +78,9 @@ class ContextManager:
                 )
         except Exception as e:
             self.logger.error(f"Error initializing storage: {e}")
+            await self.handle_context_failure(e, AlertSeverity.CRITICAL)
             raise
-
+        
     def _register_alert_handlers(self):
         """Register handlers for different alert levels"""
         self.recovery_manager.register_alert_handler(
@@ -138,22 +141,65 @@ class ContextManager:
             self.logger.error(f"Error handling high alert: {e}")
 
     async def handle_context_failure(self, error: Exception,
-                                   severity: AlertSeverity = AlertSeverity.HIGH) -> str:
-        """Handle context manager failures"""
+                                 severity: AlertSeverity = AlertSeverity.HIGH) -> str:
+        """Handle component failure with recovery"""
         try:
-            return await self.recovery_manager.handle_failure(
+            recovery_id = await self.recovery_manager.handle_failure(
                 "context_manager",
                 error,
-                severity=severity,
+                severity,
                 details={
                     "session_id": self.session_id,
                     "current_version": self.current_version,
                     "timestamp": datetime.now().isoformat()
                 }
             )
+            return recovery_id
+
         except Exception as e:
-            self.logger.error(f"Error handling context failure: {e}")
+            self.logger.error(f"Error in failure handling: {e}")
             raise
+
+    async def get_fallback_context(self) -> Optional[Dict]:
+        """Get fallback context in case of failures"""
+        try:
+            # Try to get the last valid version
+            versions = self.version_manager.list_versions(limit=5)
+            for version in versions:
+                context = self.version_manager.get_version(version.id)
+                if context and not (await self._validate_context_async(context)):
+                    continue
+                return context
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Error getting fallback context: {e}")
+            return None
+
+    async def check_context_health(self) -> bool:
+        """Check the health of the context manager"""
+        try:
+            if not self.current_context:
+                return False
+
+            # Validate current context
+            validation_errors = await self._validate_context_async(self.current_context)
+            if validation_errors:
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error checking context health: {e}")
+            return False
+        
+    def shutdown(self):
+        """Shutdown the context manager"""
+        self.executor.shutdown(wait=True)
+        self.cache_manager.shutdown()
+        if hasattr(self.recovery_manager, 'shutdown'):
+            self.recovery_manager.shutdown()
+
 
     async def _recover_context(self, recovery_id: str) -> bool:
         """Recover context after failure"""
@@ -285,7 +331,7 @@ class ContextManager:
             "history": []
         }
 
-    def load_context(self) -> Optional[Dict]:
+    async def load_context(self) -> Optional[Dict]:
         """Load context with enhanced caching and validation"""
         try:
             # Generate cache key
@@ -296,7 +342,6 @@ class ContextManager:
             if cached_context:
                 self.logger.debug("Context loaded from cache")
                 self.current_context = cached_context
-                self._record_access_pattern("load_context")
                 return cached_context
 
             # Load from file system
@@ -304,13 +349,20 @@ class ContextManager:
             if not context_file.exists():
                 return None
 
-            with context_file.open('r') as f:
-                context = yaml.safe_load(f)
+            # Use executor for file I/O operations
+            context = await asyncio.get_event_loop().run_in_executor(
+                self.executor,
+                self._load_context_file,
+                context_file
+            )
+
+            if not context:
+                return None
 
             # Validate context
-            validation_errors = ContextValidator.validate_context(context)
+            validation_errors = await self._validate_context_async(context)
             if validation_errors:
-                self._handle_validation_errors(validation_errors)
+                await self._handle_validation_errors(validation_errors)
                 return None
 
             # Update cache and internal state
@@ -329,18 +381,28 @@ class ContextManager:
 
         except Exception as e:
             self.logger.error(f"Error loading context: {e}")
+            await self.handle_context_failure(e)
             return None
-
-    def save_context(self, context: Dict, description: str,
-                    version_type: VersionType = VersionType.MINOR,
-                    changes: Optional[Dict] = None) -> bool:
+        
+    def _load_context_file(self, file_path: Path) -> Optional[Dict]:
+        """Load context from file (runs in executor)"""
+        try:
+            with file_path.open('r') as f:
+                return yaml.safe_load(f)
+        except Exception as e:
+            self.logger.error(f"Error reading context file: {e}")
+            return None
+        
+    async def save_context(self, context: Dict, description: str,
+                        version_type: VersionType = VersionType.MINOR,
+                        changes: Optional[Dict] = None) -> bool:
         """Save context with enhanced versioning and caching"""
         try:
-            with self.transaction_manager.transaction() as transaction_id:
+            async with self._get_transaction() as transaction_id:
                 # Validate context
-                validation_errors = ContextValidator.validate_context(context)
+                validation_errors = await self._validate_context_async(context)
                 if validation_errors:
-                    self._handle_validation_errors(validation_errors)
+                    await self._handle_validation_errors(validation_errors)
                     return False
 
                 # Create new version
@@ -353,27 +415,17 @@ class ContextManager:
                 if not version_id:
                     return False
 
-                # Update current context file
-                context_file = self.context_dir / "context.yaml"
+                # Update context metadata
                 context['metadata']['last_modified'] = datetime.now().isoformat()
                 context['metadata']['version'] = version_id
 
-                # Add operation to transaction
-                self.transaction_manager.add_operation(
-                    transaction_id,
-                    OperationType.FILE_WRITE,
-                    str(context_file),
-                    {"content": context},
-                    backup=True
-                )
+                # Save to file system
+                success = await self._save_context_file(context, transaction_id)
+                if not success:
+                    return False
 
-                # Write to file
-                with context_file.open('w') as f:
-                    yaml.safe_dump(context, f)
-
-                # Update cache with pattern tracking
+                # Update cache
                 cache_key = f"context_{self.session_id}"
-                pattern_id = f"context_update_{version_type.value}"
                 self.cache_manager.set(
                     cache_key,
                     context,
@@ -381,21 +433,56 @@ class ContextManager:
                     metadata={
                         "version": version_id,
                         "last_modified": context['metadata']['last_modified']
-                    },
-                    pattern_id=pattern_id
+                    }
                 )
 
                 # Update internal state
                 self.current_context = context
                 self.current_version = version_id
 
-                # Record access pattern
-                self._record_access_pattern("save_context")
-
                 return True
 
         except Exception as e:
             self.logger.error(f"Error saving context: {e}")
+            await self.handle_context_failure(e)
+            return False
+
+    async def _validate_context_async(self, context: Dict) -> List[ValidationError]:
+        """Validate context asynchronously"""
+        return await asyncio.get_event_loop().run_in_executor(
+            self.executor,
+            ContextValidator.validate_context,
+            context
+        )
+
+    async def _save_context_file(self, context: Dict, transaction_id: str) -> bool:
+        """Save context to file system (runs in executor)"""
+        try:
+            context_file = self.context_dir / "context.yaml"
+            
+            def write_file():
+                with context_file.open('w') as f:
+                    yaml.safe_dump(context, f)
+
+            # Add operation to transaction
+            self.transaction_manager.add_operation(
+                transaction_id,
+                OperationType.FILE_WRITE,
+                str(context_file),
+                {"content": context},
+                backup=True
+            )
+
+            # Execute file write in thread pool
+            await asyncio.get_event_loop().run_in_executor(
+                self.executor,
+                write_file
+            )
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error writing context file: {e}")
             return False
 
     def update_context(self, updates: Dict, path: List[str],
@@ -535,7 +622,7 @@ class ContextManager:
         cache_cleaned = self.cache_manager.cleanup()
         return versions_cleaned, cache_cleaned
 
-    def _handle_validation_errors(self, errors: List[ValidationError]) -> None:
+    async def _handle_validation_errors(self, errors: List[ValidationError]) -> None:
         """Handle validation errors with detailed logging"""
         error_msgs = "\n".join(
             f"{e.field}: {e.message} (Severity: {e.severity})"
@@ -543,7 +630,6 @@ class ContextManager:
         )
         self.logger.error(f"Context validation failed:\n{error_msgs}")
 
-        # Update failure history in context
         if self.current_context:
             self.current_context["component_context"]["failure_history"].append({
                 "timestamp": datetime.now().isoformat(),
@@ -551,7 +637,11 @@ class ContextManager:
                 "errors": [dataclasses.asdict(e) for e in errors]
             })
 
-        raise ValueError(f"Context validation failed: {len(errors)} errors found")
+        # Trigger failure handling
+        await self.handle_context_failure(
+            ValueError(f"Context validation failed: {len(errors)} errors found"),
+            AlertSeverity.HIGH
+        )
 
     def _validate_context(self, context: Dict) -> bool:
         """Validate the context using the validation framework"""
